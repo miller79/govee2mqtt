@@ -4,13 +4,11 @@ export RUST_BACKTRACE=full
 export RUST_LOG_STYLE=always
 export XDG_CACHE_HOME=/data
 
-# Clear cache if requested
-GOVEE_CLEAR_CACHE="$(bashio::config 'govee_clear_cache' '')"
-if [ "${GOVEE_CLEAR_CACHE}" = "true" ]; then
-    echo "Clearing govee2mqtt cache as requested..."
+# Clear cache if requested via addon config
+if bashio::config.true 'govee_clear_cache' 2>/dev/null; then
+    bashio::log.info "Clearing govee2mqtt cache as requested..."
     rm -f /data/govee2mqtt-cache.sqlite
-    # Reset the flag so it doesn't clear on every restart
-    bashio::addon.option 'govee_clear_cache'
+    bashio::log.info "Cache cleared. Remember to disable 'Clear Cache' in addon config to avoid clearing on every restart."
 fi
 
 wait_for_mqtt() {
