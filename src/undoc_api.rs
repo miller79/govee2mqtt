@@ -1,4 +1,5 @@
 #![allow(unused)]
+use anyhow::Context;
 use crate::cache::{cache_get, CacheComputeResult, CacheGetOptions};
 use crate::lan_api::{boolean_int, truthy};
 use crate::opt_env_var;
@@ -16,7 +17,7 @@ use uuid::Uuid;
 
 // <https://github.com/constructorfleet/homebridge-ultimate-govee/blob/main/src/data/clients/RestClient.ts>
 
-const APP_VERSION: &str = "6.5.02";
+const APP_VERSION: &str = "7.4.10";
 const HALF_DAY: Duration = Duration::from_secs(3600 * 12);
 const ONE_DAY: Duration = Duration::from_secs(86400);
 const ONE_WEEK: Duration = Duration::from_secs(86400 * 7);
@@ -54,7 +55,7 @@ impl<T: std::fmt::Debug> std::ops::Deref for Redacted<T> {
 
 fn user_agent() -> String {
     format!(
-        "GoveeHome/{APP_VERSION} (com.ihoment.GoVeeSensor; build:2; iOS 16.5.0) Alamofire/5.6.4"
+        "GoveeHome/{APP_VERSION} (com.ihoment.GoVeeSensor; build:8; iOS 18.4.0) Alamofire/5.10.2"
     )
 }
 
@@ -79,6 +80,12 @@ pub struct UndocApiArguments {
     /// the GOVEE_PASSWORD environment variable.
     #[arg(long, global = true)]
     pub govee_password: Option<String>,
+
+    /// The 2FA verification code from your email.
+    /// If not passed here, it will be read from
+    /// the GOVEE_2FA_CODE environment variable.
+    #[arg(long, global = true)]
+    pub govee_2fa_code: Option<String>,
 
     /// Where to store the AWS IoT key file.
     #[arg(long, global = true, default_value = "/dev/shm/govee.iot.key")]
@@ -126,10 +133,18 @@ impl UndocApiArguments {
         })
     }
 
+    pub fn opt_2fa_code(&self) -> anyhow::Result<Option<String>> {
+        match &self.govee_2fa_code {
+            Some(code) => Ok(Some(code.to_string())),
+            None => opt_env_var("GOVEE_2FA_CODE"),
+        }
+    }
+
     pub fn api_client(&self) -> anyhow::Result<GoveeUndocumentedApi> {
         let email = self.email()?;
         let password = self.password()?;
-        Ok(GoveeUndocumentedApi::new(email, password))
+        let two_fa_code = self.opt_2fa_code()?;
+        Ok(GoveeUndocumentedApi::new(email, password, two_fa_code))
     }
 }
 
@@ -138,10 +153,11 @@ pub struct GoveeUndocumentedApi {
     email: String,
     password: String,
     client_id: String,
+    two_fa_code: std::sync::Arc<std::sync::Mutex<Option<String>>>,
 }
 
 impl GoveeUndocumentedApi {
-    pub fn new<E: Into<String>, P: Into<String>>(email: E, password: P) -> Self {
+    pub fn new<E: Into<String>, P: Into<String>>(email: E, password: P, two_fa_code: Option<String>) -> Self {
         let email = email.into();
         let password = password.into();
         let client_id = Uuid::new_v5(&Uuid::NAMESPACE_DNS, email.as_bytes());
@@ -150,6 +166,7 @@ impl GoveeUndocumentedApi {
             email,
             password,
             client_id,
+            two_fa_code: std::sync::Arc::new(std::sync::Mutex::new(two_fa_code)),
         }
     }
 
@@ -200,12 +217,31 @@ impl GoveeUndocumentedApi {
     }
 
     async fn login_account_impl(&self) -> anyhow::Result<CacheComputeResult<LoginAccountResponse>> {
+        // When a 2FA code is present, invalidate any cached login error
+        // to ensure a fresh login attempt with the code
+        if let Ok(guard) = self.two_fa_code.lock() {
+            if guard.is_some() {
+                self.invalidate_account_login();
+            }
+        }
+
+        let mut login_data = serde_json::json!({
+            "email": self.email,
+            "password": self.password,
+            "client": &self.client_id,
+        });
+        if let Ok(code_guard) = self.two_fa_code.lock() {
+            if let Some(code) = code_guard.as_deref() {
+                login_data["code"] = serde_json::json!(code);
+            }
+        }
+
         let response = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
             .build()?
             .request(
                 Method::POST,
-                "https://app2.govee.com/account/rest/account/v1/login",
+                "https://app2.govee.com/account/rest/account/v2/login",
             )
             .header("appVersion", APP_VERSION)
             .header("clientId", &self.client_id)
@@ -213,22 +249,112 @@ impl GoveeUndocumentedApi {
             .header("iotVersion", "0")
             .header("timestamp", ms_timestamp())
             .header("User-Agent", user_agent())
-            .json(&serde_json::json!({
-                "email": self.email,
-                "password": self.password,
-                "client": &self.client_id,
-            }))
+            .json(&login_data)
             .send()
             .await?;
 
-        let resp: Response = http_response_body(response).await?;
+        let http_status = response.status();
+        let url = response.url().clone();
+        let resp_bytes = response.bytes().await?;
+
+        // Parse body status first — Govee returns HTTP 200 with application-level error codes
+        if let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(&resp_bytes) {
+            if let Some(status) = parsed.get("status").and_then(|s| s.as_u64()) {
+                if status == 454 {
+                    log::warn!("Govee login returned status 454 (2FA verification required)");
+
+                    // Only request verification email if no 2FA code was provided
+                    let has_code = self.two_fa_code.lock().map(|g| g.is_some()).unwrap_or(false);
+                    if !has_code {
+                        let topic = crate::cache::CACHE.load().topic("undoc-api")?;
+                        let already_sent = topic.get("2fa-email-sent")?.is_some();
+                        if !already_sent {
+                            log::info!("Requesting 2FA verification code to be sent to {}", self.email);
+                            match reqwest::Client::builder()
+                                .timeout(Duration::from_secs(30))
+                                .build()?
+                                .request(
+                                    Method::POST,
+                                    "https://app2.govee.com/account/rest/account/v1/verification",
+                                )
+                                .header("appVersion", APP_VERSION)
+                                .header("clientId", &self.client_id)
+                                .header("clientType", "1")
+                                .header("iotVersion", "0")
+                                .header("timestamp", ms_timestamp())
+                                .header("User-Agent", user_agent())
+                                .json(&serde_json::json!({
+                                    "type": 8,
+                                    "email": self.email,
+                                }))
+                                .send()
+                                .await
+                            {
+                                Ok(resp) if resp.status().is_success() => {
+                                    log::info!("Verification code request sent successfully");
+                                    topic.set("2fa-email-sent", b"1", FIFTEEN_MINS)?;
+                                }
+                                Ok(resp) => {
+                                    log::warn!(
+                                        "Verification code request returned status {}",
+                                        resp.status()
+                                    );
+                                }
+                                Err(err) => {
+                                    log::error!("Failed to request verification code: {err:#}");
+                                }
+                            }
+                        }
+
+                        anyhow::bail!(
+                            "2FA verification required. A code has been sent to your \
+                             Govee email ({}). Set GOVEE_2FA_CODE to the code and restart. \
+                             The code expires in ~15 minutes.",
+                            self.email
+                        );
+                    } else {
+                        anyhow::bail!(
+                            "2FA verification required but the provided code was not accepted. \
+                             Check your email for a new code, update GOVEE_2FA_CODE, and restart."
+                        );
+                    }
+                }
+
+                if status == 455 {
+                    anyhow::bail!(
+                        "2FA verification code is incorrect or expired. \
+                         Remove GOVEE_2FA_CODE and restart to request a new code, \
+                         then set the new code and restart again."
+                    );
+                }
+            }
+        }
+
+        // Fallback: check HTTP status for non-JSON errors
+        if !http_status.is_success() {
+            anyhow::bail!(
+                "Login request to {url} failed with HTTP status {http_status}: {}",
+                String::from_utf8_lossy(&resp_bytes)
+            );
+        }
+
+        let resp: ParsedResponse = serde_json::from_slice(&resp_bytes)
+            .with_context(|| format!("parsing {url} login response: {}", String::from_utf8_lossy(&resp_bytes)))?;
 
         #[derive(Deserialize, Serialize, Debug)]
         #[allow(non_snake_case, dead_code)]
-        struct Response {
+        struct ParsedResponse {
             client: LoginAccountResponse,
             message: String,
             status: u64,
+        }
+
+        // Clear the 2FA code after successful login — it's one-time use
+        if let Ok(mut code_guard) = self.two_fa_code.lock() {
+            if code_guard.is_some() {
+                log::info!("2FA login successful. You may remove GOVEE_2FA_CODE from your configuration.");
+                *code_guard = None;
+            }
         }
 
         let ttl = Duration::from_secs(resp.client.token_expire_cycle as u64);
@@ -242,7 +368,7 @@ impl GoveeUndocumentedApi {
                 key: "account-info",
                 soft_ttl: HALF_DAY,
                 hard_ttl: HALF_DAY,
-                negative_ttl: FIFTEEN_MINS,
+                negative_ttl: Duration::from_secs(10),
                 allow_stale: false,
             },
             async { self.login_account_impl().await },
