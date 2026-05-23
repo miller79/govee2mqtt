@@ -1,6 +1,7 @@
 name: Container Build
 
 on:
+  workflow_dispatch:
   pull_request:
     branches:
       - main
@@ -21,7 +22,11 @@ on:
       - ".dockerignore"
 
 env:
-  IMAGE: ghcr.io/wez/govee2mqtt
+  IMAGE: ghcr.io/miller79/govee2mqtt
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build:
