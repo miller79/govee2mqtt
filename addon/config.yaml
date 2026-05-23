@@ -35,6 +35,7 @@ schema:
   govee_password: "password?"
   govee_api_key: "password?"
   govee_2fa_code: "str?"
+  govee_clear_cache: "bool?"
   mqtt_host: "str?"
   mqtt_port: "int?"
   mqtt_username: "str?"
